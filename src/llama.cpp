@@ -6331,11 +6331,16 @@ static bool llama_context_has_mtp_outputs(const llama_context & lctx) {
         lctx.model.arch == LLM_ARCH_DEEPSEEK4);
 }
 
-static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
+// Split-capacity variant of llama_output_reserve: reserves independent row
+// counts for the logits and embedding regions of the shared output buffer
+// (MTP needs a hidden-state row per batch token but logits only for tokens
+// flagged in batch.logits). Returns false if allocation failed.
+static bool llama_output_reserve_split(
+        llama_context & lctx,
+        size_t n_logits_outputs,
+        size_t n_embd_outputs) {
     const auto & cparams = lctx.cparams;
     const auto & hparams = lctx.model.hparams;
-
-    const size_t n_outputs_max = std::max(n_outputs, (size_t) cparams.n_seq_max);
 
     const auto n_batch = cparams.n_batch;
     const auto n_vocab = hparams.n_vocab;
@@ -6346,8 +6351,11 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     const bool has_logits = !cparams.embeddings || has_mtp;
     const bool has_embd   = lctx.is_encoding || (cparams.embeddings && (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) || has_mtp;
 
-    const size_t logits_size = has_logits ? n_vocab*n_outputs_max : 0;
-    const size_t embd_size   = has_embd   ?  n_embd*n_outputs_max : 0;
+    const size_t n_logits_outputs_max = has_logits ? std::max(n_logits_outputs, (size_t) cparams.n_seq_max) : 0;
+    const size_t n_embd_outputs_max   = has_embd   ? std::max(n_embd_outputs,   (size_t) cparams.n_seq_max) : 0;
+
+    const size_t logits_size = has_logits ? n_vocab*n_logits_outputs_max : 0;
+    const size_t embd_size   = has_embd   ?  n_embd*n_embd_outputs_max   : 0;
 
     if (lctx.output_ids.empty()) {
         // init, never resized afterwards
@@ -6374,8 +6382,13 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
         lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
         if (lctx.buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
-            return 0;
+            return false;
         }
+
+        LLAMA_LOG_DEBUG("%s: output reserve: logits_rows=%zu (%.2f MiB), embd_rows=%zu (%.2f MiB), total=%.2f MiB\n",
+                __func__, n_logits_outputs_max, logits_size * sizeof(float) / 1024.0 / 1024.0,
+                n_embd_outputs_max, embd_size * sizeof(float) / 1024.0 / 1024.0,
+                new_size / 1024.0 / 1024.0);
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(lctx.buf_output);
@@ -6383,7 +6396,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
     lctx.logits = has_logits ? output_base               : nullptr;
     lctx.embd   = has_embd   ? output_base + logits_size : nullptr;
 
-    lctx.output_size = n_outputs_max;
+    lctx.output_size = std::max(n_logits_outputs_max, n_embd_outputs_max);
     lctx.logits_size = logits_size;
     lctx.embd_size   = embd_size;
 
@@ -6410,7 +6423,17 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 
     lctx.n_outputs = 0;
 
-    return n_outputs_max;
+    return true;
+}
+
+// Make sure enough space is available for outputs.
+// Returns max number of outputs for which space was reserved.
+static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
+    if (!llama_output_reserve_split(lctx, n_outputs, n_outputs)) {
+        return 0;
+    }
+
+    return std::max(n_outputs, (size_t) lctx.cparams.n_seq_max);
 }
 
 
@@ -6579,12 +6602,13 @@ static int llama_decode_internal(
     }
 
     // reserve output buffer
+    // MTP needs an embedding row per batch token but logits only for flagged
+    // tokens, so reserve the two capacities independently.
     n_outputs_embd = has_mtp && cparams.mtp_op_type == MTP_OP_NONE ? n_tokens_all : n_outputs;
-    const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
     const bool is_dflash_decode = llm_arch_is_dflash_family(lctx.model.arch);
-    const size_t reserved_outputs = llama_output_reserve(lctx, required_outputs);
-    if (reserved_outputs < required_outputs) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %zu outputs\n", __func__, required_outputs);
+    if (!llama_output_reserve_split(lctx, n_outputs, n_outputs_embd)) {
+        LLAMA_LOG_ERROR("%s: could not reserve output buffers for %u logits rows and %u embedding rows\n",
+                __func__, n_outputs, n_outputs_embd);
         return -2;
     };
 
@@ -9161,34 +9185,12 @@ struct llama_context * llama_init_from_model(
     }
 
     if (cparams.mtp && (hparams.nextn_predict_layers > 0 || model->arch == LLM_ARCH_DEEPSEEK4)) {
-        const auto n_batch = cparams.n_batch;
-        const auto n_vocab = hparams.n_vocab;
-        const auto n_embd  = llama_output_embd_width(*ctx);
-
-        const size_t logits_size = n_vocab*n_batch;
-        const size_t embd_size   = n_embd*n_batch;
-
-        if (ctx->output_ids.empty()) {
-            // init, never resized afterwards
-            ctx->output_ids.resize(n_batch);
-        }
-
-        const size_t prev_size = ctx->buf_output ? ggml_backend_buffer_get_size(ctx->buf_output) : 0;
-        const size_t new_size  = (logits_size + embd_size) * sizeof(float);
-
-        // alloc only when more than the current capacity is required
-        if (!ctx->buf_output || prev_size < new_size) {
-            if (ctx->buf_output) {
-                ggml_backend_buffer_free(ctx->buf_output);
-                ctx->buf_output = nullptr;
-                ctx->logits = nullptr;
-                ctx->embd = nullptr;
-            }
-
-            ctx->buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
-            if (ctx->buf_output == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
-            }
+        // Pre-reserve a full batch of embedding rows for MTP; the logits region
+        // grows on demand only if a batch actually requests more rows.
+        if (!llama_output_reserve_split(*ctx, cparams.n_seq_max, cparams.n_batch)) {
+            LLAMA_LOG_ERROR("%s: failed to reserve initial MTP output buffer\n", __func__);
+            llama_free(ctx);
+            return nullptr;
         }
     }
 

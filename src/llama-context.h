@@ -364,7 +364,7 @@ struct llama_context {
     float * logits      = nullptr;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
-    size_t  output_size = 0; // capacity (of tokens positions) for the output buffers
+    size_t  output_size = 0; // maximum row capacity across the output buffers (logits and embeddings are reserved independently)
     int32_t n_outputs   = 0; // number of actually-used outputs in the current ubatch or last logical batch
     int32_t n_outputs_embd = 0; // number of embedding rows produced for the current logical batch
 
