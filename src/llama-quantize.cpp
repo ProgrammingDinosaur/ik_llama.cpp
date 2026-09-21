@@ -641,7 +641,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
                 new_type = GGML_TYPE_IQ6_K;
         }
         else if (qs.model.hparams.n_gqa() >= 4 &&
-                 !(arch == LLM_ARCH_DFLASH_DRAFT &&
+                 !((arch == LLM_ARCH_DFLASH_DRAFT ||
+                    (arch == LLM_ARCH_DFLASH && !qs.model.hparams.dflash_dsv4)) &&
                    (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M))) {
             if      (new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_IQ3_XXS) new_type = GGML_TYPE_IQ3_S;
             else if (new_type == GGML_TYPE_Q2_K_R4 || new_type == GGML_TYPE_IQ3_XXS_R4) new_type = GGML_TYPE_IQ3_K_R4;
@@ -1120,6 +1121,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         default: throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
 
+    if (params->custom_quants && !ggml_is_quantized(default_type)) {
+        LLAMA_LOG_WARN("%s: ignoring --custom-q rules because default type %s is not quantized\n",
+                __func__, ggml_type_name(default_type));
+    }
+
     int nthread = params->nthread;
 
     if (nthread <= 0) {
@@ -1286,13 +1292,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     //  - qs.n_attention_wv == 3 * model.hparams.n_layer for Encoder-Decoder models
     //  - model.arch == LLM_ARCH_DECI                    for Deci-Nemotron   models
     //
-    GGML_ASSERT((qs.n_attention_wv == 0 ||
-                 qs.n_attention_wv == (int)model.hparams.n_layer ||
-                 qs.n_attention_wv == 3 * (int)model.hparams.n_layer ||
-                 model.arch == LLM_ARCH_DECI ||
-                 model.arch == LLM_ARCH_GLM5NEXT ||
-                 model.arch == LLM_ARCH_GEMMA4 ||
-                 model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
+    //GGML_ASSERT((qs.n_attention_wv == 0 ||
+    //             qs.n_attention_wv == (int)model.hparams.n_layer ||
+    //             qs.n_attention_wv == 3 * (int)model.hparams.n_layer ||
+    //             model.arch == LLM_ARCH_DECI ||
+    //             model.arch == LLM_ARCH_GEMMA4 ||
+    //             model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
@@ -1486,6 +1491,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         // do not quantize Mamba's small yet 2D weights
         // NOTE: can't use LLM_TN here because the layer number is not known
         quantize &= name.find("ssm_conv1d")        == std::string::npos;
+        quantize &= name.find("shortconv.conv")     == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
 

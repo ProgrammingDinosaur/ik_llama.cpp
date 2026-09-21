@@ -169,6 +169,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
     int n_device = model.splits.size();
     GGML_ASSERT(n_device > 1);
     GGML_ASSERT(cparams.flash_attn);
+
     ggml_cgraph * gf = llm.new_graph_custom();
 
     bool is_moe = hparams.n_expert > 0;
@@ -328,11 +329,17 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
             ggml_build_forward_expand(gf, Kcur);
             ggml_build_forward_expand(gf, Vcur);
 
+            const bool compacted = llm.kv_self.is_compacted(il);
+            const bool use_swa_window = compacted && lctx.swa_window_view.active;
+            const int32_t store_head = compacted ? llm.swa_head : llm.kv_head;
+            const int32_t n_kv_view = use_swa_window ? (int32_t) lctx.swa_window_view.w_view : llm.n_kv;
+            const int32_t kv_view_offset = use_swa_window ? (int32_t) lctx.swa_window_view.win_off : 0;
+
             auto idx = 2*n_device*il + 2*id;
             GGML_ASSERT(idx+1 < (int)lctx.cache_copies.size());
             auto k_row_size = ggml_row_size(kl->splits[id]->type, n_embd_head_k);
             ggml_tensor * k_cache_view = ggml_view_2d(ctx0, kl->splits[id], n_embd_head_k, n_tokens*n_head_kv,
-                    k_row_size, k_row_size*n_head_kv*llm.kv_head);
+                    k_row_size, k_row_size*n_head_kv*store_head);
 
             lctx.cache_copies[idx+0].cpy  = ggml_cpy(ctx0, Kcur, k_cache_view);
             cb(lctx.cache_copies[idx+0].cpy, "k_cache", il_cb);
@@ -343,7 +350,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
                 wv = wk;
             }
             auto v_cache_view = ggml_view_1d(ctx0, vl->splits[id], n_tokens*wv->splits[id]->ne[1],
-                    llm.kv_head*ggml_row_size(vl->splits[id]->type, wv->splits[id]->ne[1]));
+                    store_head*ggml_row_size(vl->splits[id]->type, wv->splits[id]->ne[1]));
             lctx.cache_copies[idx+1].step = ggml_row_size(vl->splits[id]->type, wv->splits[id]->ne[1]);
             lctx.cache_copies[idx+1].cpy  = ggml_cpy(ctx0, Vcur, v_cache_view);
             cb(lctx.cache_copies[idx+1].cpy, "v_cache", il_cb);
@@ -354,19 +361,20 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
 
             auto q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
             cb(q, "q", il_cb);
-            auto k = ggml_view_3d(ctx0, split_kl, n_embd_head_k, llm.n_kv, n_head_kv,
-                    ggml_row_size(split_kl->type, n_embd_head_k)*n_head_kv,
-                    ggml_row_size(split_kl->type, n_embd_head_k), 0);
+            auto knb1 = k_row_size*n_head_kv;
+            auto k = ggml_view_3d(ctx0, split_kl, n_embd_head_k, n_kv_view, n_head_kv,
+                    knb1, k_row_size, kv_view_offset*knb1);
             cb(k, "k", il_cb);
-            auto v = ggml_view_3d(ctx0, split_vl, n_embd_head_v, llm.n_kv, n_head_kv,
-                    ggml_row_size(split_vl->type, wv->splits[id]->ne[1]),
-                    ggml_row_size(split_vl->type, n_embd_head_v), 0);
+            auto v_row_size = ggml_row_size(split_vl->type, n_embd_head_v);
+            auto vnb1 = ggml_row_size(split_vl->type, wv->splits[id]->ne[1]);
+            auto v = ggml_view_3d(ctx0, split_vl, n_embd_head_v, n_kv_view, n_head_kv,
+                    vnb1, v_row_size, kv_view_offset*vnb1);
             cb(v, "v", il_cb);
 
             cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask_l, hparams.f_attention_scale, hparams.f_max_alibi_bias,
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             cb(cur, "fa", il_cb);
-            cur->op_params[4] = n_swa;
+            cur->op_params[4] = kv_self.cells_disordered ? 0 : n_swa;
             if (cparams.v_cache_hadamard) {
                 if (int block_size = lctx.model.hadamard_size_v(il); block_size > 0) {
                     cur = ggml_hadamard(ctx0, cur, block_size);
@@ -572,6 +580,10 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     const llama_kv_cache & target_kv     = lctx.mtp_target_ctx->kv_self;
 
     GGML_ASSERT(n_tokens <= target_kv.n);
+    // llama_new_context_with_model() refuses MTP together with --swa-compress for every arch
+    // except deepseek4, so the target cache here is never compacted and this builder addresses
+    // it by absolute cell index (target_kv.head / target_kv.n) throughout.
+    GGML_ASSERT(!target_kv.any_compacted());
 
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -692,7 +704,7 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
                     ggml_row_size(split_vl->splits[id]->type, n_embd_head)*n_head_kv,
                     ggml_row_size(split_vl->splits[id]->type, n_embd_head), 0);
                 cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask_l, hparams.f_attention_scale, 0.0f, 0.0f);
-                cur->op_params[4] = n_swa;
+                cur->op_params[4] = target_kv.cells_disordered ? 0 : n_swa;
                 cb(cur, "fa", il_cb);
                 cur = ggml_reshape_2d(ctx0, cur, split_ol->splits[id]->ne[0], ggml_nelements(cur)/split_ol->splits[id]->ne[0]);
                 cur = llm_build_lora_mm(lctx, ctx0, split_ol->splits[id], cur);
@@ -914,7 +926,11 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
     // gemma3 requires different mask for layers using sliding window (SWA)
     struct ggml_tensor * KQ_mask     = build_inp_KQ_mask(true);
-    struct ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa(true);
+    // With --swa-compress the sliding-window layers are allocated at window size, so their mask
+    // has to be built over the compacted layout rather than over n_ctx rows.
+    struct ggml_tensor * KQ_mask_swa = kv_self.any_compacted()
+        ? build_swa_mask_for_graph(hparams.n_swa, true)
+        : build_inp_KQ_mask_swa(true);
 
     auto inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
 
@@ -1011,8 +1027,11 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Kcur, "Kcur_rope", il);
             }
+            // swa_head is the store head for a compacted layer; build_std_attention passes it on the
+            // path above, so the shared-KV / no-wv path here has to pass it too.
             cur = llm_build_kv(ctx0, lctx, kv_self, gf, model.layers[il].wo, model.layers[il].bo,
-                Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, hparams.f_attention_scale, cb, il, nullptr, n_swa);
+                Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, hparams.f_attention_scale, cb, il, nullptr, n_swa,
+                -1, nullptr, nullptr, swa_head);
 
 
             if (il == n_layer - 1 && inp_out_ids) {

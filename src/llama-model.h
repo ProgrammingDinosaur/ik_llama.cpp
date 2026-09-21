@@ -8,6 +8,7 @@
 
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <set>
@@ -80,6 +81,7 @@ enum e_model {
     MODEL_34B,
     MODEL_35B,
     MODEL_36B,
+    MODEL_36B_A4B, // K2-Horizon MoVA
     MODEL_40B,
     MODEL_65B,
     MODEL_70B,
@@ -140,6 +142,12 @@ struct llama_layer_nextn {
     struct ggml_tensor * hnorm            = nullptr;
     struct ggml_tensor * shared_head_head = nullptr;
     struct ggml_tensor * shared_head_norm = nullptr;
+
+    // qwen4exp: the NextN head's final hyper-connection mixer. For merged
+    // community files these are resolved to shared_head_norm + the trunk mixer.
+    struct ggml_tensor * hc_head_norm      = nullptr;
+    struct ggml_tensor * hc_head_down      = nullptr;
+    struct ggml_tensor * hc_head_up        = nullptr;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
@@ -326,6 +334,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_shexp = nullptr;
     struct ggml_tensor * ffn_up_shexp = nullptr;
 
+    // K2 Horizon MoVA
+    struct ggml_tensor * attn_v_gate   = nullptr;
+    struct ggml_tensor * attn_v_gate_b = nullptr;
+    struct ggml_tensor * attn_v_exps   = nullptr;
+
     llama_split_tensor split_ffn_up_shexp;
     llama_split_tensor split_ffn_gate_shexp;
     llama_split_tensor split_ffn_down_shexp;
@@ -345,6 +358,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_exp_probs_b_vl = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     llama_split_tensor split_ffn_gate_b;
@@ -554,6 +568,9 @@ struct llama_model {
     std::unique_ptr<ggml_tensor> dflash_output_ptr;
     std::unique_ptr<ggml_tensor> dflash_output_mtp_ptr;
 
+    std::unique_ptr<ggml_tensor> qwen4exp_tok_embd_ptr;
+    std::unique_ptr<ggml_tensor> qwen4exp_output_ptr;
+
     llama_split_tensor split_output;
     llama_split_tensor split_output_norm;
 
@@ -645,8 +662,29 @@ struct llama_model {
 
     // a compacted sliding-window cache needs the graph to build its KQ mask over the compacted
     // layout, and the compacted mask keys on position alone, so it requires a single sequence
+    bool supports_dflash_swa_compress() const {
+        if (!llm_arch_is_dflash_family(arch) || hparams.n_swa == 0 || hparams.n_layer == 0) {
+            return false;
+        }
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (!hparams.swa_layers[il]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    int32_t dflash_swa_compress_cross_ctx(int32_t logical_cross_ctx, bool enabled) const {
+        const int32_t safe_cross_ctx = std::max<int32_t>(1, logical_cross_ctx);
+        return enabled && supports_dflash_swa_compress()
+                ? std::min<int32_t>(safe_cross_ctx, (int32_t) hparams.n_swa)
+                : safe_cross_ctx;
+    }
+
     bool supports_swa_compress() const {
-        return arch == LLM_ARCH_OPENPANGU || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_LAGUNA;
+        return arch == LLM_ARCH_OPENPANGU || arch == LLM_ARCH_DEEPSEEK4
+            || arch == LLM_ARCH_LAGUNA    || arch == LLM_ARCH_GEMMA4
+            || supports_dflash_swa_compress() ;
     }
 
     static inline int hadamard_size(int head_size) {

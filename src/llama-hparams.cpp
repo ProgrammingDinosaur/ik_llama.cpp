@@ -260,6 +260,46 @@ void llm_load_hparams(
 
     // arch-specific KVs
     switch (model.arch) {
+        case LLM_ARCH_K2_HORIZON:
+            {
+                // Common attention
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // MoVA (Mixture-of-Values Attention) — optional for dense models
+                ml.get_key(LLM_KV_ATTENTION_GROUPNORM_GROUPS,   hparams.n_norm_groups);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,      hparams.n_value_expert, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT, hparams.n_value_expert_used, false);
+                if (hparams.n_value_expert > 0) {
+                    hparams.f_norm_group_eps = hparams.f_norm_rms_eps;
+                }
+
+                // MoE expert FFN params
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+
+                // Dense/MoE layer split
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead, false);
+
+                // Model type detection
+                if (hparams.n_expert > 0) {
+                    // MoE variant
+                    switch (hparams.n_layer) {
+                        case 48: model.type = e_model::MODEL_36B_A4B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                } else {
+                    // Dense variant
+                    switch (hparams.n_layer) {
+                        case 28: model.type = e_model::MODEL_1B; break;
+                        case 36: model.type = hparams.n_embd == 2560 ? e_model::MODEL_4B : e_model::MODEL_7B; break;
+                        default: model.type = e_model::MODEL_UNKNOWN;
+                    }
+                }
+            } break;
         case LLM_ARCH_LLAMA:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -586,6 +626,50 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_LFM2:
+            {
+                ml.get_key(LLM_KV_SHORTCONV_L_CACHE,           hparams.n_shortconv_l_cache);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_CAUSAL,            hparams.causal_attn, false);
+                ml.get_key(LLM_KV_POOLING_TYPE,                hparams.pooling_type, false);
+
+                // a missing pooling key (reported as UNSPECIFIED) means a plain causal LLM
+                if (hparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
+                    hparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+                }
+
+                if (!hparams.causal_attn || hparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+                    throw std::runtime_error("LFM2: only dense causal LLM models are supported (MoE, VL, ColBERT, embedding and audio variants are not supported)");
+                }
+
+                if (hparams.n_shortconv_l_cache <= 1) {
+                    throw std::runtime_error("LFM2 shortconv.l_cache must be greater than 1");
+                }
+
+                // short-conv layers have n_head_kv == 0, GQA layers have n_head_kv > 0
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+                hparams.n_layer_dense_lead = hparams.n_layer;
+
+                switch (hparams.n_ff()) {
+                    case 2560: model.type = e_model::MODEL_220M; break;
+                    case 4608: model.type = e_model::MODEL_350M; break;
+                    case 6912: model.type = e_model::MODEL_700M; break;
+                    case 8192: model.type = e_model::MODEL_1_2B; break;
+                    case 10752: model.type = e_model::MODEL_2_6B; break;
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                if (hparams.n_swa > 0) {
+                    hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = 1.0f;
+                    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                        hparams.swa_layers[i] = hparams.recurrent_layer_arr[i] ? 0 : 1;
+                    }
+                }
+            } break;
         case LLM_ARCH_QWEN3NEXT:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -630,20 +714,45 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
 
+                // the MTP handover is the wide pre-mixer residual, so the width must not depend on an appended NextN block
+                if (hparams.dsv4_hc_mult > 1) {
+                    const uint32_t wide = hparams.n_embd * hparams.dsv4_hc_mult;
+                    if (hparams.n_embd_out != hparams.n_embd && hparams.n_embd_out != wide) {
+                        throw std::runtime_error("qwen4exp: embedding_length_out must equal n_embd * hyper-connection count");
+                    }
+                    hparams.n_embd_out = wide;
+                }
+
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                if (hparams.nextn_predict_layers >= hparams.n_layer) {
+                    throw std::runtime_error("qwen4exp: nextn_predict_layers must be smaller than block_count");
+                }
+
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
+                    // the MTP tail is a full-attention (QSA) layer regardless of the interval pattern
+                    for (uint32_t i = hparams.n_layer - hparams.nextn_predict_layers; i < hparams.n_layer; ++i) {
+                        hparams.recurrent_layer_arr[i] = false;
+                    }
                 }
 
                 {
+                    // block_count includes the nextn tail, but the converter's ratio array covers
+                    // only the main layers; the tail inherits the last main QSA layer's ratio
+                    const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
                     uint32_t n_ratios = 0;
-                    if (ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_ratios, false) && n_ratios >= hparams.n_layer) {
+                    if (ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_ratios, false) && n_ratios >= n_main) {
                         std::vector<uint32_t> ratios;
                         ml.get_arr(ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS), ratios);
-                        std::copy_n(ratios.begin(), hparams.n_layer, hparams.dsv4_compress_ratios.begin());
+                        const uint32_t n_copy = std::min<uint32_t>(n_ratios, hparams.n_layer);
+                        std::copy_n(ratios.begin(), n_copy, hparams.dsv4_compress_ratios.begin());
+                        for (uint32_t i = n_copy; i < hparams.n_layer; ++i) {
+                            hparams.dsv4_compress_ratios[i] = ratios[n_main - 1];
+                        }
                     }
                 }
 
@@ -655,9 +764,10 @@ void llm_load_hparams(
                         std::vector<uint32_t> ple_layers;
                         ml.get_arr(ml.llm_kv(LLM_KV_PLE_LAYERS), ple_layers);
                         for (uint32_t il : ple_layers) {
-                            if (il < hparams.n_layer) {
-                                hparams.ple_layer_arr[il] = true;
+                            if (il >= hparams.n_layer) {
+                                throw std::runtime_error(format("qwen4exp: PLE layer index %u is outside block count %u", il, hparams.n_layer));
                             }
+                            hparams.ple_layer_arr[il] = true;
                         }
                         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
                         ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.ple_heads_per_ngram);
@@ -693,7 +803,7 @@ void llm_load_hparams(
                     }
                 }
 
-                switch (hparams.n_layer) {
+                switch (hparams.n_layer - hparams.nextn_predict_layers) {
                     case 48: model.type = e_model::MODEL_125B_A6B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
@@ -1867,7 +1977,50 @@ void llm_load_hparams(
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM_DSA:
             {
-                const bool is_dsv4 = model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DEEPSEEK4;
+                if (model.arch == LLM_ARCH_DFLASH) {
+                    const bool has_dense_signature =
+                            ml.get_tensor_meta("blk.0.attn_q.weight") != nullptr;
+                    const bool has_dsv4_signature =
+                            ml.get_tensor_meta("blk.0.attn_q_a.weight") != nullptr ||
+                            ml.get_tensor_meta("blk.0.hc_attn_base.weight") != nullptr;
+                    if (has_dense_signature && has_dsv4_signature) {
+                        throw std::runtime_error("dflash: ambiguous dense and DSV4 tensor signatures");
+                    }
+                    if (!has_dense_signature && !has_dsv4_signature) {
+                        throw std::runtime_error("dflash: unrecognized or incomplete tensor signature");
+                    }
+                    hparams.dflash_dsv4 = has_dsv4_signature;
+                }
+                const bool dflash_dense = model.arch == LLM_ARCH_DFLASH && !hparams.dflash_dsv4;
+                if (dflash_dense) {
+                    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                    ml.get_key("dflash.block_size", hparams.dflash_block_size);
+                    ml.get_key(LLM_KV_TOKENIZER_MASK_ID, hparams.dflash_mask_token_id);
+                    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+                    load_dflash_target_layer_ids(ml, "dflash.target_layers", hparams, true);
+
+                    const ggml_tensor * fc = ml.get_tensor_meta("fc.weight");
+                    if (fc == nullptr || fc->ne[0] <= 0 || fc->ne[1] != hparams.n_embd) {
+                        throw std::runtime_error("dflash: fc.weight must have shape [n_target_features, embedding_length]");
+                    }
+                    hparams.dflash_n_target_features = (uint32_t) fc->ne[0];
+                    hparams.dflash_backbone_rotary_base = hparams.rope_freq_base_train;
+                    hparams.dflash_laguna = false;
+
+                    for (uint32_t i = 0; i < hparams.dflash_n_target_layers; ++i) {
+                        if (hparams.dflash_target_layer_ids[i] == 0) {
+                            throw std::runtime_error("dflash: target_layers must use one-based IDs");
+                        }
+                        --hparams.dflash_target_layer_ids[i];
+                    }
+                    validate_dflash_hparams(hparams, model.arch);
+
+                    hparams.n_layer_kv_from_start = hparams.n_layer;
+                    model.type = e_model::MODEL_UNKNOWN;
+                    break;
+                }
+                const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || hparams.dflash_dsv4;
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
                 if (model.arch == LLM_ARCH_DEEPSEEK4 && hparams.n_layer == 43 && hparams.nextn_predict_layers > 0) {
                     LLAMA_LOG_WARN("===============================================================================================\n");
@@ -1962,6 +2115,8 @@ void llm_load_hparams(
                     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false) && hparams.n_swa > 0) {
                         std::fill(hparams.swa_layers.begin(), hparams.swa_layers.end(), true);
                     }
+                    // DSV4 vision: in a non-causal (image) span the window only clips older tokens
+                    hparams.swa_full_non_causal = true;
 
                     const auto * hc_head_base = ml.get_tensor_meta("hc_head_base");
                     const uint32_t probe_layer = dsv4_probe_layer;

@@ -433,6 +433,7 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool defer_ple;        // keep the per-layer token embedding on the file instead of resident in memory (Linux only)
         bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
     };
 
@@ -517,6 +518,7 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+        int32_t             dflash_query_capacity; // internal DFlash query capacity override
     };
 
     // model quantization parameters
@@ -708,12 +710,20 @@ extern "C" {
     // Returns true if the model is openPangu (conv-only recurrent state that rides the spec-rollback checkpoint)
     LLAMA_API bool llama_model_is_openpangu(const struct llama_model * model);
 
+    LLAMA_API bool llama_kv_cache_is_compacted(const struct llama_context * ctx);
+
+    LLAMA_API llama_pos llama_kv_cache_swa_rewind_floor(const struct llama_context * ctx);
+
+    LLAMA_API llama_pos llama_kv_cache_n_swa(const struct llama_context * ctx);
+
     // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
     LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
 
     LLAMA_API bool llama_model_is_step35(const struct llama_model * model);
 
     LLAMA_API bool llama_model_is_qwen35_family(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_qwen4exp(const struct llama_model * model);
 
     LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);
 
